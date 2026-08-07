@@ -1,3 +1,4 @@
+## How to use this script?
 
 1. install py packages
 ```bash
@@ -10,4 +11,18 @@ pip install google-generativeai openai
 export GEMINI_API_KEY=your_key_here
 python srt_translate.py --list-models
 python srt_translate.py input_ar.srt -o output_id.srt --lang Indonesian --provider gemini --model gemini-3.5-flash-lite --batch-size 1000
+```
+
+---
+
+## How to download yt video?
+
+```bash
+python3 -m pip install -U yt-dlp
+python3 -m yt_dlp --version
+python3 -m yt_dlp \
+  -f "bv*+ba/b" \
+  --merge-output-format mp4 \
+  -o "%(title)s.%(ext)s" \
+  "yt_video_link"
 ```
