@@ -103,10 +103,10 @@ colloquial movie subtitle translation.
 Source language: {source_lang}. This is an auto-generated (speech-recognition) subtitle \
 file, so it may contain transcription errors, misheard words, or garbled phrases — infer \
 the most likely intended meaning from context and translate that.
-
+{source_country_note}
 Target language: {target_lang}, written in a natural, everyday SPOKEN/colloquial register \
 — not formal or literary.
-
+{target_country_note}
 Translation rules:
 - Prioritize natural meaning and dialogue flow over literal, word-for-word translation.
 - Adapt idioms, slang, and cultural references into equivalent natural expressions in \
@@ -327,7 +327,8 @@ def chunk(blocks, size):
         yield blocks[i:i + size]
 
 
-def translate_all(blocks, provider, model, api_key, source_lang, target_lang,
+def translate_all(blocks, provider, model, api_key, source_language, source_country,
+                   source_lang_override, target_language, target_country,
                    batch_size, max_retries, progress_path, min_interval=0.0):
     translations = {}
     if os.path.exists(progress_path):
@@ -335,8 +336,9 @@ def translate_all(blocks, provider, model, api_key, source_lang, target_lang,
             translations = {int(k): v for k, v in json.load(f).items()}
         print(f"Resuming from cache: {len(translations)} lines already translated.")
 
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        source_lang=source_lang, target_lang=target_lang
+    system_prompt = build_system_prompt(
+        source_language, source_country, source_lang_override,
+        target_language, target_country,
     )
 
     remaining_blocks = [b for b in blocks if b["num"] not in translations]
@@ -417,6 +419,47 @@ def compose_target_lang(language, country):
     if country:
         return f"{language} as naturally spoken in {country} (colloquial everyday register)"
     return language
+
+
+def _dialect_emphasis(role, language, country):
+    """A country folded into one descriptive phrase (e.g. "Arabic as spoken in
+    Egypt") is an easy detail for a model to skim past in a longer prompt.
+    This produces a short, standalone, impossible-to-miss instruction line
+    reinforcing it — repetition of the load-bearing constraint is a real
+    accuracy lever for LLM prompts, not just redundancy."""
+    country = (country or "").strip()
+    if not country:
+        return ""
+    language = (language or "").strip()
+    return (
+        f"IMPORTANT — {role} dialect precision: this is specifically the "
+        f"{language} used in {country}. Use the regional variety, vocabulary, "
+        f"idioms, expressions, and natural phrasing that native speakers in "
+        f"{country} would actually use in everyday conversation. Prefer this "
+        f"regional variety over generic, overly formal, or other-region variants "
+        f"of {language}. Do not force regional slang when it would sound unnatural "
+        f"in the given context.\n"
+    )
+
+
+def build_system_prompt(source_language, source_country, source_lang_override,
+                         target_language, target_country):
+    source_lang_desc = compose_source_lang(source_language, source_country, source_lang_override)
+    target_lang_desc = compose_target_lang(target_language, target_country)
+
+    # A raw --source-lang override replaces the whole description, so there's
+    # no separate "country" concept left to emphasize on that side.
+    source_country_note = "" if source_lang_override else _dialect_emphasis(
+        "source", source_language, source_country
+    )
+    target_country_note = _dialect_emphasis("target", target_language, target_country)
+
+    return SYSTEM_PROMPT_TEMPLATE.format(
+        source_lang=source_lang_desc,
+        target_lang=target_lang_desc,
+        source_country_note=source_country_note,
+        target_country_note=target_country_note,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -614,8 +657,11 @@ def main():
             provider=args.provider,
             model=model,
             api_key=api_key,
-            source_lang=source_lang_desc,
-            target_lang=target_lang_desc,
+            source_language=args.source_language,
+            source_country=args.source_country,
+            source_lang_override=args.source_lang,
+            target_language=args.lang,
+            target_country=args.target_country,
             batch_size=args.batch_size,
             max_retries=args.max_retries,
             progress_path=progress_path,
