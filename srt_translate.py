@@ -3,9 +3,13 @@
 srt_translate.py — Translate a .srt subtitle file with Gemini or GPT.
 
 Usage:
-    python srt_translate.py input_ar.srt
+    python srt_translate.py                              # interactive wizard (no flags needed)
+    python srt_translate.py input_ar.srt                  # flags, prompted for anything missing
     python srt_translate.py input_ar.srt -o output_id.srt --lang Indonesian
     python srt_translate.py input_ar.srt --provider openai --model gpt-4o
+    python srt_translate.py input.srt --source-language Spanish --source-country Mexico \
+        --lang English --target-country "United States"
+    python srt_translate.py input.srt --interactive       # force the wizard even with flags set
 
 API keys (env vars, or pass --api-key):
     GEMINI_API_KEY   (or GOOGLE_API_KEY)   — for --provider gemini (default)
@@ -50,6 +54,7 @@ How it works:
 """
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -182,6 +187,35 @@ class QuotaExceededError(RuntimeError):
     pass
 
 
+class MissingDependencyError(RuntimeError):
+    pass
+
+
+_PROVIDER_PACKAGE = {"gemini": "google-generativeai", "openai": "openai"}
+
+
+def _check_dependency_error(e, provider):
+    """A missing package (e.g. 'No module named google') can't be fixed by
+    retrying — it'll fail identically every time. Also, a script silently
+    retrying 3x on this hides the real cause behind noise, and the fix
+    itself is ambiguous unless we say exactly which Python it needs
+    installing into (very common gotcha: pip installed into one env/venv,
+    script run with a different one)."""
+    if not isinstance(e, ModuleNotFoundError):
+        return
+    package = _PROVIDER_PACKAGE.get(provider, provider)
+    raise MissingDependencyError(
+        f"{e}\n"
+        f"The '{package}' package isn't installed for the Python currently running "
+        f"this script ({sys.executable}).\n"
+        f"Install it into that exact interpreter with:\n"
+        f"  {sys.executable} -m pip install {package}\n"
+        f"(If you're using a virtualenv, make sure it's activated before running "
+        f"this script — a package installed in one environment isn't visible from "
+        f"another.)"
+    ) from e
+
+
 # Google's 429 error text embeds the server-suggested wait, e.g.
 # "... retry_delay { seconds: 34 } ...". Respecting it (instead of a short
 # fixed backoff) is the difference between actually recovering and just
@@ -220,6 +254,7 @@ def call_provider(provider, model, api_key, system_prompt, user_payload, max_ret
             else:
                 raise ValueError(f"Unknown provider: {provider}")
         except Exception as e:  # noqa: BLE001 - want to retry on any transient error
+            _check_dependency_error(e, provider)  # raises MissingDependencyError; never retry this
             err_text = str(e)
 
             # A missing/deprecated model won't fix itself on retry — fail fast
@@ -335,7 +370,7 @@ def translate_all(blocks, provider, model, api_key, source_lang, target_lang,
                                                 single_payload, max_retries, min_interval)
                     single_result = parse_model_json(raw_single)
                     result.update(single_result)
-                except (QuotaExceededError, ModelNotFoundError):
+                except (QuotaExceededError, ModelNotFoundError, MissingDependencyError):
                     # Not a per-line problem — don't mask it as a fallback-to-source
                     # for every remaining line, let it stop the run so progress
                     # (already cached) can be resumed once the real issue is fixed.
@@ -355,8 +390,115 @@ def translate_all(blocks, provider, model, api_key, source_lang, target_lang,
 
 
 # --------------------------------------------------------------------------
-# CLI
+# Language description composition
 # --------------------------------------------------------------------------
+#
+# The model doesn't just need a language name — a dialect varies enormously
+# by country ("Arabic" alone is ambiguous between Egyptian, Levantine, Gulf,
+# Maghrebi... each close to a different language in casual speech). Letting
+# the user name the language AND the country the movie/target audience is
+# from lets the prompt request the actual spoken dialect instead of a
+# generic/formal register neither side would use.
+
+def compose_source_lang(language, country, raw_override=None):
+    if raw_override:
+        return raw_override
+    language = (language or "the source language").strip()
+    country = (country or "").strip()
+    if country:
+        return (f"{language} as colloquially spoken in {country} (the everyday spoken "
+                f"dialect/accent used there — not formal or standard {language})")
+    return f"{language} (natural colloquial spoken dialect)"
+
+
+def compose_target_lang(language, country):
+    language = (language or "the target language").strip()
+    country = (country or "").strip()
+    if country:
+        return f"{language} as naturally spoken in {country} (colloquial everyday register)"
+    return language
+
+
+# --------------------------------------------------------------------------
+# Interactive wizard
+# --------------------------------------------------------------------------
+
+def prompt(question, default=None, choices=None, allow_empty=False, secret=False):
+    """Ask a question on the terminal. Enter accepts `default`. `allow_empty`
+    lets the user explicitly clear a field by entering nothing when there's
+    no default. `secret` uses getpass so the answer isn't echoed."""
+    hint = f" ({'/'.join(choices)})" if choices else ""
+    if default:
+        hint += f" [{default}]"
+    elif allow_empty:
+        hint += " [blank]"
+
+    reader = getpass.getpass if secret else input
+    while True:
+        raw = reader(f"{question}{hint}: ")
+        raw = raw.strip() if raw else raw
+        if not raw:
+            if default:
+                return default
+            if allow_empty:
+                return ""
+            print("  This is required — please enter a value.")
+            continue
+        if choices and raw.lower() not in [c.lower() for c in choices]:
+            print(f"  Please choose one of: {', '.join(choices)}")
+            continue
+        return raw
+
+
+def interactive_wizard(args):
+    print("=== Interactive setup — press Enter to accept the default shown in [brackets] ===\n")
+
+    args.input_srt = prompt("Path to source .srt file", default=args.input_srt)
+    while not os.path.exists(args.input_srt):
+        print(f"  File not found: {args.input_srt}")
+        args.input_srt = prompt("Path to source .srt file")
+
+    print("\n-- Source (what the movie/dialogue actually is) --")
+    args.source_language = prompt(
+        "Source language (e.g. Arabic, Spanish, French, Hindi)",
+        default=args.source_language,
+    )
+    args.source_country = prompt(
+        "Country/region the movie is from — sets the dialect (e.g. Egypt, Lebanon, "
+        "Mexico, Argentina). Leave blank for a generic/standard dialect",
+        default=args.source_country, allow_empty=True,
+    ) or None
+
+    print("\n-- Target (what you want the subtitles translated into) --")
+    args.lang = prompt("Target language to translate into", default=args.lang)
+    args.target_country = prompt(
+        "Country/region for the target dialect/accent (e.g. Indonesia, Spain, "
+        "Argentina). Leave blank for a generic/standard register",
+        default=args.target_country, allow_empty=True,
+    ) or None
+
+    print("\n-- Translation engine --")
+    args.provider = prompt("Provider", default=args.provider, choices=["gemini", "openai"])
+    args.model = prompt("Model", default=args.model or default_model(args.provider))
+
+    if not resolve_api_key(args.provider, args.api_key):
+        env_hint = "GEMINI_API_KEY" if args.provider == "gemini" else "OPENAI_API_KEY"
+        print(f"\nNo {env_hint} found in your environment.")
+        args.api_key = prompt(
+            f"Paste your {args.provider} API key now (used for this run only; "
+            f"set {env_hint} to skip this next time)",
+            secret=True,
+        )
+
+    print("\n-- Output & batching --")
+    args.output = prompt(
+        "Output .srt path", default=args.output or "", allow_empty=True,
+    ) or None
+    args.batch_size = int(prompt("Subtitle lines per API call (batch size)",
+                                  default=str(args.batch_size)))
+    print()
+    return args
+
 
 def default_model(provider):
     # "-latest" aliases track whatever Google currently recommends, so this
@@ -386,18 +528,31 @@ def resolve_api_key(provider, cli_key):
 def main():
     parser = argparse.ArgumentParser(description="Translate a .srt file with Gemini or GPT.")
     parser.add_argument("input_srt", nargs="?", help="Path to the source .srt file")
+    parser.add_argument("--interactive", "-i", action="store_true",
+                         help="Force the interactive Q&A wizard even if flags are already "
+                              "set (it also runs automatically whenever input_srt is omitted)")
     parser.add_argument("--list-models", action="store_true",
                          help="List models your Gemini API key can use, then exit")
     parser.add_argument("-o", "--output", help="Output .srt path (default: <input>_<lang>.srt)")
     parser.add_argument("--lang", default="Indonesian",
-                         help="Target language (default: Indonesian)")
-    parser.add_argument("--source-lang", default="Egyptian Arabic (colloquial dialect)",
-                         help="Description of the source language/dialect for the model")
+                         help="Target language to translate into (default: Indonesian)")
+    parser.add_argument("--target-country", default=None,
+                         help="Country/region for the target dialect/accent, e.g. Indonesia, "
+                              "Spain, Argentina (optional — sharpens which local dialect is used)")
+    parser.add_argument("--source-language", default="Arabic",
+                         help="Source language (default: Arabic)")
+    parser.add_argument("--source-country", default="Egypt",
+                         help="Country/region the movie is from — sets the source dialect/"
+                              "accent, e.g. Egypt, Lebanon, Mexico (default: Egypt)")
+    parser.add_argument("--source-lang", default=None,
+                         help="Raw override for the full source-language description sent to "
+                              "the model, bypassing --source-language/--source-country")
     parser.add_argument("--provider", choices=["gemini", "openai"], default="gemini")
     parser.add_argument("--model", default=None,
-                         help="Model name (default: gemini-2.5-flash / gpt-4o)")
+                         help="Model name (default: gemini-flash-latest / gpt-4o)")
     parser.add_argument("--api-key", default=None,
-                         help="API key (else read from env var)")
+                         help="API key (else read from env var, or prompted for in "
+                              "interactive mode)")
     parser.add_argument("--batch-size", type=int, default=100,
                          help="Subtitle lines per API call (default: 100)")
     parser.add_argument("--max-retries", type=int, default=3)
@@ -409,19 +564,25 @@ def main():
                          help="Ignore any cached progress and start over")
     args = parser.parse_args()
 
-    api_key = resolve_api_key(args.provider, args.api_key)
-    if not api_key:
-        env_hint = "GEMINI_API_KEY (or GOOGLE_API_KEY)" if args.provider == "gemini" else "OPENAI_API_KEY"
-        sys.exit(f"No API key found. Set {env_hint} or pass --api-key.")
-
     if args.list_models:
+        api_key = resolve_api_key(args.provider, args.api_key)
+        if not api_key:
+            env_hint = "GEMINI_API_KEY (or GOOGLE_API_KEY)" if args.provider == "gemini" else "OPENAI_API_KEY"
+            sys.exit(f"No API key found. Set {env_hint} or pass --api-key.")
         if args.provider != "gemini":
             sys.exit("--list-models currently only supports --provider gemini.")
         list_gemini_models(api_key)
         return
 
-    if not args.input_srt:
-        sys.exit("input_srt is required (unless using --list-models).")
+    # Drop into the wizard whenever the user didn't already give us a file to
+    # work with, or explicitly asked for it via --interactive/-i.
+    if args.interactive or not args.input_srt:
+        args = interactive_wizard(args)
+
+    api_key = resolve_api_key(args.provider, args.api_key)
+    if not api_key:
+        env_hint = "GEMINI_API_KEY (or GOOGLE_API_KEY)" if args.provider == "gemini" else "OPENAI_API_KEY"
+        sys.exit(f"No API key found. Set {env_hint} or pass --api-key.")
 
     model = args.model or default_model(args.provider)
 
@@ -436,9 +597,16 @@ def main():
 
     min_interval = 60.0 / args.rpm if args.rpm > 0 else 0.0
 
+    source_lang_desc = compose_source_lang(args.source_language, args.source_country,
+                                            args.source_lang)
+    target_lang_desc = compose_target_lang(args.lang, args.target_country)
+
     print(f"Parsing {args.input_srt} ...")
     blocks = parse_srt(args.input_srt)
     print(f"Found {len(blocks)} subtitle blocks.")
+    print(f"Source: {source_lang_desc}")
+    print(f"Target: {target_lang_desc}")
+    print(f"Provider/model: {args.provider} / {model}\n")
 
     try:
         translations = translate_all(
@@ -446,14 +614,14 @@ def main():
             provider=args.provider,
             model=model,
             api_key=api_key,
-            source_lang=args.source_lang,
-            target_lang=args.lang,
+            source_lang=source_lang_desc,
+            target_lang=target_lang_desc,
             batch_size=args.batch_size,
             max_retries=args.max_retries,
             progress_path=progress_path,
             min_interval=min_interval,
         )
-    except (ModelNotFoundError, QuotaExceededError) as e:
+    except (ModelNotFoundError, QuotaExceededError, MissingDependencyError) as e:
         print(f"\n[stopped] {e}", file=sys.stderr)
         print(f"Progress so far is cached in {progress_path} — rerun the same command "
               f"once resolved and it will resume from there.", file=sys.stderr)
